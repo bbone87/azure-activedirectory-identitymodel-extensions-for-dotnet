@@ -71,5 +71,17 @@ namespace Microsoft.IdentityModel.Protocols.WsTrust
             get => _requestType;
             set => _requestType = string.IsNullOrEmpty(value) ? throw LogHelper.LogArgumentNullException(nameof(RequestType)) : value;
         }
+
+        public override bool Equals(object obj)
+        {
+            // TODO
+            return base.Equals(obj);
+        }
+
+        public override int GetHashCode()
+        {
+            // TODO
+            return base.GetHashCode();
+        }
     }
 }

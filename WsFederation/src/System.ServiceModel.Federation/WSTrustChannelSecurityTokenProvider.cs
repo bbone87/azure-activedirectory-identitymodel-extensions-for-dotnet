@@ -8,6 +8,7 @@ using System.IdentityModel.Selectors;
 using System.IdentityModel.Tokens;
 using System.IO;
 using System.ServiceModel.Channels;
+using System.ServiceModel.Caching;
 using System.ServiceModel.Security;
 using System.ServiceModel.Security.Tokens;
 using System.Text;
@@ -26,14 +27,111 @@ namespace System.ServiceModel.Federation
     /// </summary>
     public class WSTrustChannelSecurityTokenProvider : SecurityTokenProvider
     {
+        internal const bool DefaultCacheIssuedTokens = true;
+        internal static readonly TimeSpan DefaultMaxIssuedTokenCachingTime = TimeSpan.MaxValue;
+        internal const int DefaultIssuedTokenRenewalThresholdPercentage = 60;
+
+        private TimeSpan _maxIssuedTokenCachingTime = DefaultMaxIssuedTokenCachingTime;
+        private int _issuedTokenRenewalThresholdPercentage = DefaultIssuedTokenRenewalThresholdPercentage;
+        private ISecurityTokenCache<WsTrustRequest> _cache;
+
         public WSTrustChannelSecurityTokenProvider(SecurityTokenRequirement tokenRequirement)
         {
             SecurityTokenRequirement = tokenRequirement ?? throw new ArgumentNullException(nameof(tokenRequirement));
+            _cache = new InMemoryWSTrustSecurityTokenCache<WsTrustRequest>();
         }
 
         public SecurityTokenRequirement SecurityTokenRequirement
         {
             get;
+        }
+
+        /// <summary>
+        /// Gets or sets the cache used for storing issued security tokens.
+        /// </summary>
+        public ISecurityTokenCache<WsTrustRequest> IssuedTokensCache
+        {
+            get => _cache;
+            set => _cache = value ?? throw new ArgumentNullException(nameof(value));
+        }
+
+        /// <summary>
+        /// Gets or sets whether issued tokens should be cached and reused within their expiry periods.
+        /// </summary>
+        public bool CacheIssuedTokens { get; set; } = DefaultCacheIssuedTokens;
+
+        /// <summary>
+        /// Gets or sets the maximum time an issued token will be cached before renewing it.
+        /// </summary>
+        public TimeSpan MaxIssuedTokenCachingTime
+        {
+            get => _maxIssuedTokenCachingTime;
+            set => _maxIssuedTokenCachingTime = value <= TimeSpan.Zero
+                ? throw new ArgumentOutOfRangeException(nameof(value), "TimeSpan must be greater than TimeSpan.Zero.") // TODO - Get exception messages from resources
+                : value;
+        }
+
+        /// <summary>
+        /// Gets or sets the percentage of the issued token's lifetime at which it should be renewed instead of cached.
+        /// </summary>
+        public int IssuedTokenRenewalThresholdPercentage
+        {
+            get => _issuedTokenRenewalThresholdPercentage;
+            set => _issuedTokenRenewalThresholdPercentage = (value <= 0 || value > 100)
+                ? throw new ArgumentOutOfRangeException(nameof(value), "Issued token renewal threshold percentage must be greater than or equal to 1 and less than or equal to 100.")
+                : value;
+        }
+
+        private SecurityToken GetCachedTokenForRequest(WsTrustRequest request)
+        {
+            if (CacheIssuedTokens)
+            {
+                var cachedToken = IssuedTokensCache?.GetSecurityToken(request);
+                if (IsSecurityTokenUnexpired(cachedToken))
+                {
+                    return cachedToken;
+                }
+            }
+
+            return null;
+        }
+
+        private bool IsSecurityTokenUnexpired(SecurityToken cachedToken)
+        {
+            if (cachedToken == null)
+            {
+                return false;
+            }
+
+            DateTime fromTime = cachedToken.ValidFrom.ToUniversalTime();
+            DateTime toTime = cachedToken.ValidTo.ToUniversalTime();
+
+            long interval = fromTime.Ticks - toTime.Ticks;
+            long effectiveInterval = (long)((IssuedTokenRenewalThresholdPercentage / (double)100) * interval);
+            DateTime effectiveExpiration = AddTicks(fromTime, Math.Min(effectiveInterval, MaxIssuedTokenCachingTime.Ticks));
+
+            return effectiveExpiration > DateTime.UtcNow;
+        }
+
+        private DateTime AddTicks(DateTime time, long ticks)
+        {
+            if (ticks > 0 && DateTime.MaxValue.Subtract(time).Ticks <= ticks)
+            {
+                return DateTime.MaxValue;
+            }
+            if (ticks < 0 && time.Subtract(DateTime.MinValue).Ticks <= -ticks)
+            {
+                return DateTime.MinValue;
+            }
+            return time.AddTicks(ticks);
+        }
+
+        private void CacheToken(WsTrustRequest request, SecurityToken token)
+        {
+            if (CacheIssuedTokens)
+            {
+                IssuedTokensCache?.CacheSecurityToken(request, token);
+            }
         }
 
         /// <summary>
@@ -57,6 +155,13 @@ namespace System.ServiceModel.Federation
                 RequestType = WsTrustConstants.Trust13.WsTrustActions.Issue,
                 TokenType = SecurityTokenRequirement.TokenType
             };
+
+            // Check whether an unexpired token has been cached for this request and, if so, return it
+            SecurityToken cachedToken = GetCachedTokenForRequest(wsTrustRequest);
+            if (cachedToken != null)
+            {
+                return cachedToken;
+            }
 
             WsTrustResponse trustResponse = null;
             using (var memeoryStream = new MemoryStream())
@@ -108,13 +213,24 @@ namespace System.ServiceModel.Federation
                 var element = WsSecuritySerializer.GetXmlElement(securityTokenReference, WsTrustVersion.Trust13);
                 dom.Load(new XmlTextReader(stream) { DtdProcessing = DtdProcessing.Prohibit });
                 GenericXmlSecurityKeyIdentifierClause securityKeyIdentifierClause = new GenericXmlSecurityKeyIdentifierClause(element);
-                return new GenericXmlSecurityToken(dom.DocumentElement,
+                var securityToken = new GenericXmlSecurityToken(dom.DocumentElement,
                                                    proofToken,
                                                    DateTime.UtcNow,
                                                    DateTime.UtcNow + TimeSpan.FromDays(1),
                                                    securityKeyIdentifierClause,
                                                    securityKeyIdentifierClause,
                                                    null);
+
+                CacheToken(wsTrustRequest, securityToken);
+                return securityToken;
+            }
+        }
+
+        protected override void CancelTokenCore(TimeSpan timeout, SecurityToken token)
+        {
+            if (CacheIssuedTokens)
+            {
+                IssuedTokensCache.RemoveSecurityToken(token);
             }
         }
     }
